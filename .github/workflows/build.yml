@@ -1,0 +1,272 @@
+# Windows installer build + release, run in the PUBLIC repo Dr-Zaid/fares-ovens-releases.
+# Copy of this file lives there at .github/workflows/build.yml (source of truth: this file, desktop/release-pipeline/).
+#
+# Why here and not in the private code repo: GitHub Actions on standard runners is free and unlimited for
+# public repositories, while a private repo gets 2,000 min/month and Windows minutes count double.
+# The code stays private: this workflow checks it out with a read-only deploy key (secret SOURCE_DEPLOY_KEY).
+# Nothing new becomes public: the installer this publishes was already public in this repo.
+#
+# Run it (after pushing the tag in the code repo):
+#   gh workflow run build.yml --repo Dr-Zaid/fares-ovens-releases -f ref=v1.0.8
+# A ref that is not a version tag (e.g. desktop-app) builds and tests only, without publishing.
+#
+# Secrets in THIS repo: SOURCE_DEPLOY_KEY (private half of a read-only deploy key on the code repo),
+# VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY (public anon key). Publishing uses the built-in GITHUB_TOKEN.
+name: Desktop installer (Windows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Tag (v1.0.8) to build and publish, or a branch to build and test only'
+        required: true
+        default: desktop-app
+
+concurrency:
+  group: desktop-${{ inputs.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPO: Dr-Zaid/Fares-Al-Dhahabi-Ovens
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    env:
+      VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+      VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+      REF: ${{ inputs.ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+
+      # A tag must match package.json "version": electron-updater compares that number with the installed app.
+      - name: Check the tag matches the app version
+        if: startsWith(inputs.ref, 'v')
+        shell: bash
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ "${REF}" != "v${version}" ]; then
+            echo "::error::Tag ${REF} does not match package.json version ${version}. Bump the version, commit, then tag v${version}."
+            exit 1
+          fi
+
+      - name: Check repository secrets
+        shell: bash
+        run: |
+          if [ -z "$VITE_SUPABASE_URL" ] || [ -z "$VITE_SUPABASE_ANON_KEY" ]; then
+            echo "::error::Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY as repository secrets."
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Fetch PostgREST (pinned, checksum-verified)
+        run: node desktop/scripts/fetch-postgrest.mjs windows
+
+      # A clean PC has no PostgreSQL and maybe no Visual C++ runtime: ship every DLL beside its program.
+      - name: Bundle runtime DLLs (libpq for PostgREST, Visual C++ runtime)
+        run: node desktop/scripts/win-runtime.mjs stage
+
+      - name: Build installer
+        run: npm run desktop:dist
+
+      - name: Check every bundled program has its DLLs
+        run: node desktop/scripts/win-runtime.mjs check release/win-unpacked/resources
+
+      # The in-app updater needs resources/app-update.yml (where to look) and, on the release, latest.yml + the blockmap.
+      - name: Check update metadata
+        shell: bash
+        run: |
+          test -f release/win-unpacked/resources/app-update.yml || { echo "::error::app-update.yml missing: check the publish block in desktop/electron-builder.yml"; exit 1; }
+          test -f release/latest.yml || { echo "::error::latest.yml was not generated"; exit 1; }
+          ls release/*.exe.blockmap >/dev/null || { echo "::error::installer blockmap was not generated"; exit 1; }
+          cat release/latest.yml
+
+      - name: Smoke test (start Postgres, PostgREST and gateway, then exit)
+        shell: bash
+        timeout-minutes: 5
+        run: ./release/win-unpacked/FaresOvens.exe --smoke-test
+
+      # The smoke run uses a temp userData dir (fares-smoke-*) and writes logs/startup.log on failure.
+      - name: Print smoke startup log
+        if: failure()
+        shell: bash
+        run: |
+          for f in "$LOCALAPPDATA"/Temp/fares-smoke-*/logs/startup.log "${TEMP:-/tmp}"/fares-smoke-*/logs/startup.log; do
+            [ -f "$f" ] && { echo "== $f"; cat "$f"; }
+          done || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FaresOvens-Setup-windows
+          path: |
+            release/*.exe
+            release/*.exe.blockmap
+            release/latest.yml
+          if-no-files-found: error
+          retention-days: 30
+
+  # Tests the INSTALLED app (silent NSIS install), not the unpacked folder: a real PC failed
+  # at PostgREST while the unpacked smoke passed.
+  windows-e2e:
+    needs: windows
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: windows-2022, variant: standard}
+          - {os: windows-2025, variant: standard}
+          - {os: windows-2025, variant: arabic}
+    env:
+      CI: 'true'
+      VARIANT: ${{ matrix.variant }}
+      # Keep browsers inside node_modules: the arabic variant overrides LOCALAPPDATA.
+      PLAYWRIGHT_BROWSERS_PATH: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Fetch PostgREST (pinned, checksum-verified)
+        run: node desktop/scripts/fetch-postgrest.mjs windows
+
+      - name: Install Playwright Chromium (phone web part of the e2e)
+        run: npx playwright install chromium
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: FaresOvens-Setup-windows
+          path: installer
+
+      - name: Silent install
+        shell: pwsh
+        run: |
+          $setup = (Get-ChildItem installer -Filter *.exe | Select-Object -First 1).FullName
+          Write-Host "Installer: $setup"
+          if ($env:VARIANT -eq 'arabic') {
+            $dir = 'C:\Users\Public\أفران فارس الذهبي'
+            # NSIS: /D must be the last argument and unquoted.
+            Start-Process -Wait -FilePath $setup -ArgumentList "/S /D=$dir"
+          } else {
+            $dir = Join-Path $env:LOCALAPPDATA 'Programs\FaresOvens'
+            Start-Process -Wait -FilePath $setup -ArgumentList '/S'
+          }
+          Write-Host "Install dir: $dir"
+          Get-ChildItem -Force $dir | Format-Table Name, Length
+          $exe = Join-Path $dir 'FaresOvens.exe'
+          if (-not (Test-Path -LiteralPath $exe)) { Write-Error "FaresOvens.exe not found at $exe"; exit 1 }
+          Get-ChildItem -Force (Join-Path $dir 'resources\postgrest') | Format-Table Name, Length
+          "FARES_E2E_EXECUTABLE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          node desktop/scripts/win-runtime.mjs check (Join-Path $dir 'resources')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Runners ship PostgreSQL on PATH, which hid a missing LIBPQ.dll. Test like a clean PC.
+      - name: Remove preinstalled PostgreSQL and libpq from PATH
+        shell: pwsh
+        run: |
+          # Also drops other folders that carry a libpq.dll (the runner's PHP has one).
+          $clean = ($env:PATH -split ';' | Where-Object { $_ -and $_ -notmatch 'PostgreSQL' -and -not (Test-Path -LiteralPath (Join-Path $_ 'libpq.dll')) }) -join ';'
+          "PATH=$clean" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $env:PATH = $clean
+          $found = $clean -split ';' | Where-Object { $_ -and (Test-Path -LiteralPath (Join-Path $_ 'libpq.dll')) }
+          if ($found) { Write-Error "libpq.dll still on PATH: $found"; exit 1 }
+
+      - name: Arabic profile path (e2e data root stays ASCII)
+        if: matrix.variant == 'arabic'
+        shell: pwsh
+        run: |
+          # dataDir.ts falls back to ProgramData when LOCALAPPDATA is non-ASCII.
+          $local = 'C:\Users\Public\بيانات\AppData\Local'
+          New-Item -ItemType Directory -Force -Path $local | Out-Null
+          $root = 'C:\fares-e2e-data'
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          "LOCALAPPDATA=$local" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "FARES_E2E_DATA_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Smoke test the installed app
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $p = Start-Process -FilePath $env:FARES_E2E_EXECUTABLE -ArgumentList '--smoke-test' -PassThru -Wait
+          Write-Host "Exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { exit $p.ExitCode }
+
+      - name: Electron e2e against the installed app
+        timeout-minutes: 30
+        run: npx playwright test
+
+      - name: Collect smoke logs
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path test-results/smoke-logs | Out-Null
+          Get-ChildItem -Path $env:TEMP -Directory -Filter 'fares-smoke-*' -ErrorAction SilentlyContinue |
+            ForEach-Object { Copy-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $_.FullName 'logs') (Join-Path test-results/smoke-logs $_.Name) }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-${{ matrix.os }}-${{ matrix.variant }}
+          path: |
+            test-results/
+            playwright-report/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # Publishes the exact installer that just passed the installed-app E2E to THIS repo's releases,
+  # which the app's updater reads (desktop/electron-builder.yml `publish`). Version tags only.
+  release:
+    if: startsWith(inputs.ref, 'v')
+    needs: [windows, windows-e2e]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.ref }}
+      RELEASES_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: FaresOvens-Setup-windows
+          path: release
+
+      - name: Publish installer, latest.yml and blockmap
+        shell: bash
+        run: |
+          ls -l release
+          test -f release/latest.yml
+          installer="$(ls release/FaresOvens-Setup-*.exe | head -n 1)"
+          # Draft first, publish last: the updater must never see a release that has no latest.yml yet.
+          if gh release view "$TAG" --repo "$RELEASES_REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$installer" "$installer.blockmap" release/latest.yml --repo "$RELEASES_REPO" --clobber
+          else
+            gh release create "$TAG" "$installer" "$installer.blockmap" release/latest.yml \
+              --repo "$RELEASES_REPO" --target main --draft --title "$TAG" --notes "Fares Ovens desktop $TAG"
+          fi
+          gh release edit "$TAG" --repo "$RELEASES_REPO" --draft=false --latest

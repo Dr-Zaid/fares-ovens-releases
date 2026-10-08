@@ -66,6 +66,18 @@ jobs:
             exit 1
           fi
 
+      # v1.0.8 shipped with a broken anon key (the secret held the text of a gh command) and the shop PC could
+      # not reach the cloud at all. Ask Supabase itself: only the real key gets 200. Prints the status only.
+      - name: Check the Supabase key is accepted
+        shell: bash
+        run: |
+          status="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -H "apikey: $VITE_SUPABASE_ANON_KEY" "$VITE_SUPABASE_URL/auth/v1/settings")"
+          echo "Supabase auth settings answered HTTP $status"
+          if [ "$status" != "200" ]; then
+            echo "::error::Supabase rejected VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY (HTTP $status). Re-set the secret to the plain anon key only."
+            exit 1
+          fi
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
